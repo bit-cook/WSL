@@ -898,69 +898,94 @@ class WSLCTests
 
         LogInfo("Test: Before/Since filters");
         {
-            // Get all images to find their IDs
+            // Get all images to find their IDs and creation times
             wil::unique_cotaskmem_array_ptr<WSLCImageInformation> allImages;
             VERIFY_SUCCEEDED(m_defaultSession->ListImages(nullptr, allImages.addressof(), allImages.size_address<ULONG>()));
 
             std::string debianId, pythonId;
+            LONGLONG debianCreated = 0, pythonCreated = 0;
             for (const auto& image : allImages)
             {
                 std::string imageName = image.Image;
                 if (imageName == "debian:latest")
                 {
                     debianId = image.Hash;
+                    debianCreated = image.Created;
                 }
                 else if (imageName == "python:3.12-alpine")
                 {
                     pythonId = image.Hash;
+                    pythonCreated = image.Created;
                 }
             }
 
             VERIFY_IS_FALSE(debianId.empty());
             VERIFY_IS_FALSE(pythonId.empty());
 
-            // Test 'since' filter - images created after debian
+            // Both Created timestamps must be populated and distinct so that the since/before
+            // boundaries are unambiguous. Equal timestamps would make Docker's filter behavior
+            // ambiguous and could reintroduce flakiness.
+            VERIFY_IS_GREATER_THAN(debianCreated, 0LL);
+            VERIFY_IS_GREATER_THAN(pythonCreated, 0LL);
+            VERIFY_ARE_NOT_EQUAL(debianCreated, pythonCreated);
+
+            // Determine which image is older/newer based on actual creation timestamps.
+            // Image creation times come from the registry and can change independently.
+            const bool debianIsOlder = debianCreated < pythonCreated;
+            const auto& olderId = debianIsOlder ? debianId : pythonId;
+            const auto& newerId = debianIsOlder ? pythonId : debianId;
+            const auto* olderName = debianIsOlder ? "debian:latest" : "python:3.12-alpine";
+            const auto* newerName = debianIsOlder ? "python:3.12-alpine" : "debian:latest";
+
+            LogInfo(
+                "Older image: %hs (Created: %lld), Newer image: %hs (Created: %lld)",
+                olderName,
+                debianIsOlder ? debianCreated : pythonCreated,
+                newerName,
+                debianIsOlder ? pythonCreated : debianCreated);
+
+            // Test 'since' filter - images created after the older image
             {
                 WSLCListImageOptions options{};
                 options.Flags = WSLCListImagesFlagsNone;
-                options.Since = debianId.c_str();
+                options.Since = olderId.c_str();
 
                 wil::unique_cotaskmem_array_ptr<WSLCImageInformation> images;
                 VERIFY_SUCCEEDED(m_defaultSession->ListImages(&options, images.addressof(), images.size_address<ULONG>()));
                 VERIFY_IS_TRUE(images.size() > 0);
 
-                bool foundPython = false;
+                bool foundNewer = false;
                 for (const auto& image : images)
                 {
                     LogInfo("Image: %hs, Hash: %hs, Created: %lld", image.Image, image.Hash, image.Created);
-                    if (std::string{image.Image} == "python:3.12-alpine")
+                    if (std::string{image.Image} == newerName)
                     {
-                        foundPython = true;
+                        foundNewer = true;
                     }
                 }
 
-                VERIFY_IS_TRUE(foundPython);
+                VERIFY_IS_TRUE(foundNewer);
             }
 
-            // Test 'before' filter - images created before python
+            // Test 'before' filter - images created before the newer image
             {
                 WSLCListImageOptions options{};
                 options.Flags = WSLCListImagesFlagsNone;
-                options.Before = pythonId.c_str();
+                options.Before = newerId.c_str();
                 wil::unique_cotaskmem_array_ptr<WSLCImageInformation> images;
                 VERIFY_SUCCEEDED(m_defaultSession->ListImages(&options, images.addressof(), images.size_address<ULONG>()));
                 VERIFY_IS_TRUE(images.size() > 0);
 
-                bool foundDebian = false;
+                bool foundOlder = false;
                 for (const auto& image : images)
                 {
-                    if (std::string{image.Image} == "debian:latest")
+                    if (std::string{image.Image} == olderName)
                     {
-                        foundDebian = true;
+                        foundOlder = true;
                     }
                 }
 
-                VERIFY_IS_TRUE(foundDebian);
+                VERIFY_IS_TRUE(foundOlder);
             }
         }
 
