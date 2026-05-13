@@ -5736,7 +5736,10 @@ class WSLCTests
         options.Name = "test-custom-network-empty";
         options.InitProcessOptions.CommandLine = {.Values = args, .Count = ARRAYSIZE(args)};
         options.ContainerNetwork.ContainerNetworkType = WSLCContainerNetworkTypeCustom;
-        options.ContainerNetwork.ContainerNetworkName = "";
+        WSLCNetworkAttachment emptyNet{};
+        emptyNet.NetworkName = "";
+        options.ContainerNetwork.Networks = &emptyNet;
+        options.ContainerNetwork.NetworksCount = 1;
 
         wil::com_ptr<IWSLCContainer> container;
         auto hr = m_defaultSession->CreateContainer(&options, &container);
@@ -5876,6 +5879,254 @@ class WSLCTests
         VERIFY_ARE_EQUAL(recoveredContainer.State(), WslcContainerStateRunning);
 
         VERIFY_ARE_EQUAL(recoveredContainer.Inspect().HostConfig.NetworkMode, networkName);
+    }
+
+    WSLC_TEST_METHOD(ContainerMultipleNetworksTest)
+    {
+        const std::string primaryNetwork = "multi-net-primary";
+        const std::string additionalNetwork = "multi-net-additional";
+
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str()));
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(additionalNetwork.c_str()));
+
+        WSLCDriverOption primaryOpts[] = {{"Subnet", "172.40.0.0/16"}};
+        WSLCNetworkOptions primaryNetOpts{};
+        primaryNetOpts.Name = primaryNetwork.c_str();
+        primaryNetOpts.Driver = "bridge";
+        primaryNetOpts.DriverOpts = primaryOpts;
+        primaryNetOpts.DriverOptsCount = ARRAYSIZE(primaryOpts);
+        VERIFY_SUCCEEDED(m_defaultSession->CreateNetwork(&primaryNetOpts));
+        auto primaryCleanup = wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str())); });
+
+        WSLCDriverOption additionalOpts[] = {{"Subnet", "172.41.0.0/16"}};
+        WSLCNetworkOptions additionalNetOpts{};
+        additionalNetOpts.Name = additionalNetwork.c_str();
+        additionalNetOpts.Driver = "bridge";
+        additionalNetOpts.DriverOpts = additionalOpts;
+        additionalNetOpts.DriverOptsCount = ARRAYSIZE(additionalOpts);
+        VERIFY_SUCCEEDED(m_defaultSession->CreateNetwork(&additionalNetOpts));
+        auto additionalCleanup =
+            wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteNetwork(additionalNetwork.c_str())); });
+
+        WSLCContainerLauncher launcher(
+            "debian:latest", "test-multi-net", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeCustom);
+        launcher.SetContainerNetworkName(std::string(primaryNetwork));
+        launcher.AddAdditionalNetwork(additionalNetwork);
+
+        auto container = launcher.Launch(*m_defaultSession);
+        VERIFY_ARE_EQUAL(container.State(), WslcContainerStateRunning);
+
+        auto inspect = container.Inspect();
+        VERIFY_ARE_EQUAL(inspect.HostConfig.NetworkMode, primaryNetwork);
+        VERIFY_IS_TRUE(inspect.NetworkSettings.Networks.contains(primaryNetwork));
+        VERIFY_IS_TRUE(inspect.NetworkSettings.Networks.contains(additionalNetwork));
+        VERIFY_IS_FALSE(inspect.NetworkSettings.Networks.at(primaryNetwork).IPAddress.empty());
+        VERIFY_IS_FALSE(inspect.NetworkSettings.Networks.at(additionalNetwork).IPAddress.empty());
+    }
+
+    WSLC_TEST_METHOD(ContainerAdditionalNetworksRejectedForHostAndNoneTest)
+    {
+        // This check runs before network existence is validated, so no real network needs to exist.
+        const std::string additionalNetwork = "any-additional-net";
+
+        {
+            WSLCContainerLauncher launcher(
+                "debian:latest", "test-multi-net-host-reject", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeHost);
+            launcher.AddAdditionalNetwork(additionalNetwork);
+
+            auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+            VERIFY_ARE_EQUAL(E_INVALIDARG, retVal.first);
+            ValidateCOMErrorMessage(L"Additional networks are not allowed when the primary network mode is 'host' or 'none'.");
+        }
+
+        {
+            WSLCContainerLauncher launcher(
+                "debian:latest", "test-multi-net-none-reject", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeNone);
+            launcher.AddAdditionalNetwork(additionalNetwork);
+
+            auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+            VERIFY_ARE_EQUAL(E_INVALIDARG, retVal.first);
+            ValidateCOMErrorMessage(L"Additional networks are not allowed when the primary network mode is 'host' or 'none'.");
+        }
+    }
+
+    WSLC_TEST_METHOD(ContainerDuplicateNetworkRejectedTest)
+    {
+        const std::string primaryNetwork = "multi-net-dup-primary";
+
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str()));
+
+        WSLCDriverOption opts[] = {{"Subnet", "172.48.0.0/16"}};
+        WSLCNetworkOptions netOpts{};
+        netOpts.Name = primaryNetwork.c_str();
+        netOpts.Driver = "bridge";
+        netOpts.DriverOpts = opts;
+        netOpts.DriverOptsCount = ARRAYSIZE(opts);
+        VERIFY_SUCCEEDED(m_defaultSession->CreateNetwork(&netOpts));
+        auto cleanup = wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str())); });
+
+        WSLCContainerLauncher launcher(
+            "debian:latest", "test-multi-net-dup-reject", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeCustom);
+        launcher.SetContainerNetworkName(std::string(primaryNetwork));
+        launcher.AddAdditionalNetwork(primaryNetwork);
+
+        auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+        VERIFY_ARE_EQUAL(E_INVALIDARG, retVal.first);
+        ValidateCOMErrorMessage(
+            std::format(L"Duplicate network: '{}'", std::wstring(primaryNetwork.begin(), primaryNetwork.end())).c_str());
+    }
+
+    WSLC_TEST_METHOD(ContainerAdditionalNetworkNotFoundRejectedTest)
+    {
+        const std::string primaryNetwork = "multi-net-notfound-primary";
+        const std::string missingNetwork = "multi-net-nonexistent";
+
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str()));
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(missingNetwork.c_str()));
+
+        WSLCDriverOption opts[] = {{"Subnet", "172.49.0.0/16"}};
+        WSLCNetworkOptions netOpts{};
+        netOpts.Name = primaryNetwork.c_str();
+        netOpts.Driver = "bridge";
+        netOpts.DriverOpts = opts;
+        netOpts.DriverOptsCount = ARRAYSIZE(opts);
+        VERIFY_SUCCEEDED(m_defaultSession->CreateNetwork(&netOpts));
+        auto cleanup = wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str())); });
+
+        WSLCContainerLauncher launcher(
+            "debian:latest", "test-multi-net-notfound-reject", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeCustom);
+        launcher.SetContainerNetworkName(std::string(primaryNetwork));
+        launcher.AddAdditionalNetwork(missingNetwork);
+
+        auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+        VERIFY_ARE_EQUAL(WSLC_E_NETWORK_NOT_FOUND, retVal.first);
+        ValidateCOMErrorMessage(
+            std::format(L"Network not found: '{}'", std::wstring(missingNetwork.begin(), missingNetwork.end())).c_str());
+    }
+
+    WSLC_TEST_METHOD(ContainerBridgedPrimaryDuplicateNetworkRejectedTest)
+    {
+        // Verifies that passing the primary bridge network as an additional network is caught as a duplicate.
+        WSLCContainerLauncher launcher(
+            "debian:latest", "test-bridge-dup-reject", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeBridged);
+        launcher.AddAdditionalNetwork("bridge");
+
+        auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+        VERIFY_ARE_EQUAL(E_INVALIDARG, retVal.first);
+        ValidateCOMErrorMessage(L"Duplicate network: 'bridge'");
+    }
+
+    WSLC_TEST_METHOD(ContainerAdditionalNetworkMalformedNameTest)
+    {
+        // Most malformed names fall through to the network lookup.
+
+        // Invalid character.
+        {
+            WSLCContainerLauncher launcher(
+                "debian:latest", "test-invalid-name-char", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeBridged);
+            launcher.AddAdditionalNetwork("bad/name");
+
+            auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+            VERIFY_ARE_EQUAL(WSLC_E_NETWORK_NOT_FOUND, retVal.first);
+            ValidateCOMErrorMessage(L"Network not found: 'bad/name'");
+        }
+
+        // Empty name.
+        {
+            WSLCContainerLauncher launcher(
+                "debian:latest", "test-invalid-name-empty", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeBridged);
+            launcher.AddAdditionalNetwork("");
+
+            auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+            VERIFY_ARE_EQUAL(E_INVALIDARG, retVal.first);
+            ValidateCOMErrorMessage(L"Network name cannot be empty.");
+        }
+
+        // Name exceeds WSLC_MAX_NETWORK_NAME_LENGTH (255).
+        {
+            const std::string tooLongName(WSLC_MAX_NETWORK_NAME_LENGTH + 1, 'a');
+
+            WSLCContainerLauncher launcher(
+                "debian:latest", "test-invalid-name-long", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeBridged);
+            launcher.AddAdditionalNetwork(tooLongName);
+
+            auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+            VERIFY_ARE_EQUAL(WSLC_E_NETWORK_NOT_FOUND, retVal.first);
+            ValidateCOMErrorMessage(std::format(L"Network not found: '{}'", std::wstring(tooLongName.begin(), tooLongName.end())).c_str());
+        }
+    }
+
+    WSLC_TEST_METHOD(ContainerDeleteAdditionalNetworkWhileInUseTest)
+    {
+        const std::string primaryNetwork = "multi-net-del-primary";
+        const std::string additionalNetwork = "multi-net-del-additional";
+
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str()));
+        LOG_IF_FAILED(m_defaultSession->DeleteNetwork(additionalNetwork.c_str()));
+
+        WSLCDriverOption primaryOpts[] = {{"Subnet", "172.50.0.0/16"}};
+        WSLCNetworkOptions primaryNetOpts{};
+        primaryNetOpts.Name = primaryNetwork.c_str();
+        primaryNetOpts.Driver = "bridge";
+        primaryNetOpts.DriverOpts = primaryOpts;
+        primaryNetOpts.DriverOptsCount = ARRAYSIZE(primaryOpts);
+        VERIFY_SUCCEEDED(m_defaultSession->CreateNetwork(&primaryNetOpts));
+        auto primaryCleanup = wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteNetwork(primaryNetwork.c_str())); });
+
+        WSLCDriverOption additionalOpts[] = {{"Subnet", "172.51.0.0/16"}};
+        WSLCNetworkOptions additionalNetOpts{};
+        additionalNetOpts.Name = additionalNetwork.c_str();
+        additionalNetOpts.Driver = "bridge";
+        additionalNetOpts.DriverOpts = additionalOpts;
+        additionalNetOpts.DriverOptsCount = ARRAYSIZE(additionalOpts);
+        VERIFY_SUCCEEDED(m_defaultSession->CreateNetwork(&additionalNetOpts));
+        auto additionalCleanup =
+            wil::scope_exit([&]() { LOG_IF_FAILED(m_defaultSession->DeleteNetwork(additionalNetwork.c_str())); });
+
+        WSLCContainerLauncher launcher(
+            "debian:latest", "test-multi-net-del", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeCustom);
+        launcher.SetContainerNetworkName(std::string(primaryNetwork));
+        launcher.AddAdditionalNetwork(additionalNetwork);
+
+        auto container = launcher.Launch(*m_defaultSession);
+        VERIFY_ARE_EQUAL(container.State(), WslcContainerStateRunning);
+
+        VERIFY_ARE_EQUAL(HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION), m_defaultSession->DeleteNetwork(additionalNetwork.c_str()));
+    }
+
+    WSLC_TEST_METHOD(ContainerNetworkAttachmentIpAddressRejectedTest)
+    {
+        // ContainerIpAddress is reserved and must be null today.
+        LPCSTR args[] = {"sleep", "99999"};
+
+        WSLCContainerOptions options{};
+        options.Image = "debian:latest";
+        options.Name = "test-network-ip-reserved";
+        options.InitProcessOptions.CommandLine = {.Values = args, .Count = ARRAYSIZE(args)};
+        options.ContainerNetwork.ContainerNetworkType = WSLCContainerNetworkTypeBridged;
+        WSLCNetworkAttachment netWithIp{};
+        netWithIp.NetworkName = "bridge";
+        netWithIp.ContainerIpAddress = "10.0.0.5";
+        options.ContainerNetwork.Networks = &netWithIp;
+        options.ContainerNetwork.NetworksCount = 1;
+
+        wil::com_ptr<IWSLCContainer> container;
+        auto hr = m_defaultSession->CreateContainer(&options, &container);
+        VERIFY_ARE_EQUAL(E_NOTIMPL, hr);
+        ValidateCOMErrorMessage(L"ContainerIpAddress is not yet supported.");
+    }
+
+    WSLC_TEST_METHOD(ContainerCustomNetworkMissingPrimaryWithAdditionalRejectedTest)
+    {
+        // Custom + additional networks without a primary network name must be rejected,
+        // not silently promote the first additional to primary.
+        WSLCContainerLauncher launcher(
+            "debian:latest", "test-custom-no-primary", {"sleep", "99999"}, {}, WSLCContainerNetworkType::WSLCContainerNetworkTypeCustom);
+        launcher.AddAdditionalNetwork("any-net");
+
+        auto retVal = launcher.LaunchNoThrow(*m_defaultSession);
+        VERIFY_ARE_EQUAL(E_INVALIDARG, retVal.first);
+        ValidateCOMErrorMessage(L"Container network name is required for custom network type.");
     }
 
     WSLC_TEST_METHOD(ContainerInspect)
